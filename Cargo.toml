@@ -64,6 +64,6 @@ opt-level = 3
 lto = true
 strip = true
 
-[build]
+[target]
 # CARGO_BUILD_RUSTFLAGS
 rustflags = ["-Ctarget-cpu=native"]
