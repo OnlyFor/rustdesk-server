@@ -55,6 +55,9 @@ ping = "0.4.0"
 # rusqlite = { version = "*", features = ["bundled", "bundled-sqlcipher"] }
 libsqlite3-sys = { version = "*", features = ["bundled"] }
 
+mimalloc = { version = "*" }
+
+
 [build-dependencies]
 hbb_common = { path = "libs/hbb_common" }
 
