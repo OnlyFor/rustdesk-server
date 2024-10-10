@@ -54,7 +54,7 @@ ping = "0.4.0"
 # 静态编译必须
 # rusqlite = { version = "*", features = ["bundled", "bundled-sqlcipher"] }
 libsqlite3-sys = { version = "*", features = ["bundled"] }
-
+# 需要同时修改 src/main.rs
 mimalloc = { version = "*" }
 
 
