@@ -65,8 +65,13 @@ hbb_common = { path = "libs/hbb_common" }
 members = ["libs/hbb_common"]
 exclude = ["ui"]
 
+#https://github.com/johnthagen/min-sized-rust
+#https://doc.rust-lang.org/cargo/reference/profiles.html#default-profiles
 [profile.release]
-opt-level = 3
 lto = true
-strip = true
 codegen-units = 1
+panic = 'abort'
+strip = true
+opt-level = 3
+#opt-level = 'z' # only have smaller size after strip # Default is 3, better performance
+#rpath = true # Not needed
