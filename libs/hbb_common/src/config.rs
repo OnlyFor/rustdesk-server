@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use rand::Rng;
 use regex::Regex;
@@ -18,6 +18,19 @@ use serde_derive::{Deserialize, Serialize};
 use serde_json;
 use sodiumoxide::base64;
 use sodiumoxide::crypto::sign;
+
+mod permanent_password;
+
+pub use permanent_password::{
+    compute_permanent_password_h1, decode_permanent_password_h1_from_storage,
+    decode_preset_password_h1_from_storage, local_permanent_password_storage_is_usable_for_auth,
+    preset_permanent_password_storage_is_usable_for_auth, ENCRYPT_MAX_LEN,
+};
+use permanent_password::{
+    decode_permanent_password_h1_from_hashed_storage, decrypt_permanent_password_str_or_original,
+    encode_permanent_password_encrypted_storage_from_h1, password_is_empty_or_not_hashed,
+    preset_permanent_password_storage_matches_plain, DEFAULT_SALT_LEN, PASSWORD_ENC_VERSION,
+};
 
 use crate::{
     compress::{compress, decompress},
@@ -38,8 +51,6 @@ pub const READ_TIMEOUT: u64 = 18_000;
 pub const REG_INTERVAL: i64 = 15_000;
 pub const COMPRESS_LEVEL: i32 = 3;
 const SERIAL: i32 = 3;
-const PASSWORD_ENC_VERSION: &str = "00";
-pub const ENCRYPT_MAX_LEN: usize = 128; // used for password, pin, etc, not for all
 
 #[cfg(target_os = "macos")]
 lazy_static::lazy_static! {
@@ -72,6 +83,11 @@ lazy_static::lazy_static! {
     pub static ref BUILTIN_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
 }
 
+#[cfg(target_os = "android")]
+lazy_static::lazy_static! {
+    pub static ref ANDROID_RUSTLS_PLATFORM_VERIFIER_INITIALIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+}
+
 lazy_static::lazy_static! {
     pub static ref APP_DIR: RwLock<String> = Default::default();
 }
@@ -85,6 +101,7 @@ pub const LINK_DOCS_HOME: &str = "https://rustdesk.com/docs/en/";
 pub const LINK_DOCS_X11_REQUIRED: &str = "https://rustdesk.com/docs/en/manual/linux/#x11-required";
 pub const LINK_HEADLESS_LINUX_SUPPORT: &str =
     "https://github.com/rustdesk/rustdesk/wiki/Headless-Linux-Support";
+
 lazy_static::lazy_static! {
     pub static ref HELPER_URL: HashMap<&'static str, &'static str> = HashMap::from([
         ("rustdesk docs home", LINK_DOCS_HOME),
@@ -92,6 +109,8 @@ lazy_static::lazy_static! {
         ("rustdesk x11 headless", LINK_HEADLESS_LINUX_SUPPORT),
         ]);
 }
+
+const NUM_CHARS: &[char] = &['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'];
 
 const CHARS: &[char] = &[
     '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k',
@@ -103,6 +122,31 @@ pub const RS_PUB_KEY: &str = "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=";
 
 pub const RENDEZVOUS_PORT: i32 = 20116;
 pub const RELAY_PORT: i32 = 20117;
+pub const WS_RENDEZVOUS_PORT: i32 = 20118;
+pub const WS_RELAY_PORT: i32 = 20119;
+
+#[inline]
+pub fn is_service_ipc_postfix(postfix: &str) -> bool {
+    // `_service` is a protected cross-user IPC channel used by the root service.
+    //
+    // On Linux Wayland, input injection is implemented via uinput in the root service process.
+    // The user `--server` process must be able to connect to these uinput IPC channels, so they
+    // must share the same IPC parent directory as `_service`.
+    postfix == "_service" || postfix.starts_with("_uinput_")
+}
+
+// Keep Linux/macOS IPC parent directory rules in one place to avoid drift between
+// `ipc_path()` and Unix `ipc_path_for_uid()`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[inline]
+fn ipc_parent_dir_for_uid(uid: u32, postfix: &str) -> String {
+    let app_name = APP_NAME.read().unwrap().clone();
+    if is_service_ipc_postfix(postfix) {
+        format!("/tmp/{app_name}-service")
+    } else {
+        format!("/tmp/{app_name}-{uid}")
+    }
+}
 
 macro_rules! serde_field_string {
     ($default_func:ident, $de_func:ident, $default_expr:expr) => {
@@ -238,13 +282,18 @@ pub struct PeerConfig {
         skip_serializing_if = "String::is_empty"
     )]
     pub view_style: String,
-    // Image scroll style, scrollbar or scroll auto
+    // Image scroll style, scrolledge, scrollbar or scroll auto
     #[serde(
         default = "PeerConfig::default_scroll_style",
         deserialize_with = "PeerConfig::deserialize_scroll_style",
         skip_serializing_if = "String::is_empty"
     )]
     pub scroll_style: String,
+    #[serde(
+        default = "PeerConfig::default_edge_scroll_edge_thickness",
+        deserialize_with = "PeerConfig::deserialize_edge_scroll_edge_thickness"
+    )]
+    pub edge_scroll_edge_thickness: i32,
     #[serde(
         default = "PeerConfig::default_image_quality",
         deserialize_with = "PeerConfig::deserialize_image_quality",
@@ -261,6 +310,8 @@ pub struct PeerConfig {
     pub show_remote_cursor: ShowRemoteCursor,
     #[serde(flatten)]
     pub lock_after_session_end: LockAfterSessionEnd,
+    #[serde(flatten)]
+    pub terminal_persistent: TerminalPersistent,
     #[serde(flatten)]
     pub privacy_mode: PrivacyMode,
     #[serde(flatten)]
@@ -290,6 +341,8 @@ pub struct PeerConfig {
     #[serde(flatten)]
     pub view_only: ViewOnly,
     #[serde(flatten)]
+    pub show_my_cursor: ShowMyCursor,
+    #[serde(flatten)]
     pub sync_init_clipboard: SyncInitClipboard,
     // Mouse wheel or touchpad scroll mode
     #[serde(
@@ -310,6 +363,12 @@ pub struct PeerConfig {
         skip_serializing_if = "String::is_empty"
     )]
     pub use_all_my_displays_for_the_remote_session: String,
+    #[serde(
+        rename = "trackpad-speed",
+        default = "PeerConfig::default_trackpad_speed",
+        deserialize_with = "PeerConfig::deserialize_trackpad_speed"
+    )]
+    pub trackpad_speed: i32,
 
     #[serde(
         default,
@@ -343,10 +402,12 @@ impl Default for PeerConfig {
             size_pf: Default::default(),
             view_style: Self::default_view_style(),
             scroll_style: Self::default_scroll_style(),
+            edge_scroll_edge_thickness: Self::default_edge_scroll_edge_thickness(),
             image_quality: Self::default_image_quality(),
             custom_image_quality: Self::default_custom_image_quality(),
             show_remote_cursor: Default::default(),
             lock_after_session_end: Default::default(),
+            terminal_persistent: Default::default(),
             privacy_mode: Default::default(),
             allow_swap_key: Default::default(),
             port_forwards: Default::default(),
@@ -359,10 +420,12 @@ impl Default for PeerConfig {
             follow_remote_window: Default::default(),
             keyboard_mode: Default::default(),
             view_only: Default::default(),
+            show_my_cursor: Default::default(),
             reverse_mouse_wheel: Self::default_reverse_mouse_wheel(),
             displays_as_individual_windows: Self::default_displays_as_individual_windows(),
             use_all_my_displays_for_the_remote_session:
                 Self::default_use_all_my_displays_for_the_remote_session(),
+            trackpad_speed: Self::default_trackpad_speed(),
             custom_resolutions: Default::default(),
             options: Self::default_options(),
             ui_flutter: Default::default(),
@@ -453,13 +516,19 @@ impl Config2 {
 
     fn store(&self) {
         let mut config = self.clone();
+        let stored = Config::load_::<Config2>("2");
         if let Some(mut socks) = config.socks {
+            let stored_password = stored
+                .socks
+                .as_ref()
+                .map(|socks| socks.password.as_str())
+                .unwrap_or_default();
             socks.password =
-                encrypt_str_or_original(&socks.password, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+                keep_encrypted_storage_if_plaintext_unchanged(&socks.password, stored_password);
             config.socks = Some(socks);
         }
         config.unlock_pin =
-            encrypt_str_or_original(&config.unlock_pin, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+            keep_encrypted_storage_if_plaintext_unchanged(&config.unlock_pin, &stored.unlock_pin);
         Config::store_(&config, "2");
     }
 
@@ -476,6 +545,14 @@ impl Config2 {
         lock.store();
         true
     }
+}
+
+fn keep_encrypted_storage_if_plaintext_unchanged(plain: &str, stored: &str) -> String {
+    let (stored_plain, encrypted, _) = decrypt_str_or_original(stored, PASSWORD_ENC_VERSION);
+    if encrypted && stored_plain == plain {
+        return stored.to_owned();
+    }
+    encrypt_str_or_original(plain, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN)
 }
 
 pub fn load_path<T: serde::Serialize + serde::de::DeserializeOwned + Default + std::fmt::Debug>(
@@ -535,9 +612,9 @@ impl Config {
     fn load() -> Config {
         let mut config = Config::load_::<Config>("");
         let mut store = false;
-        let (password, _, store1) = decrypt_str_or_original(&config.password, PASSWORD_ENC_VERSION);
-        config.password = password;
-        store |= store1;
+        if let Err(err) = Self::validate_or_decrypt_permanent_password_storage(&mut config) {
+            log::error!("Failed to validate or decrypt permanent password storage: {err}");
+        }
         let mut id_valid = false;
         let (id, encrypted, store2) = decrypt_str_or_original(&config.enc_id, PASSWORD_ENC_VERSION);
         if encrypted {
@@ -559,8 +636,9 @@ impl Config {
             store = true;
         }
         if !id_valid {
+            log::warn!("ID is invalid, generating new one");
             for _ in 0..3 {
-                if let Some(id) = Config::get_auto_id() {
+                if let Some(id) = Config::gen_id() {
                     config.id = id;
                     store = true;
                     break;
@@ -575,11 +653,84 @@ impl Config {
         config
     }
 
+    fn validate_or_decrypt_permanent_password_storage(config: &mut Config) -> Result<()> {
+        if config.password.is_empty() {
+            return Ok(());
+        }
+
+        if config.password.starts_with(PASSWORD_ENC_VERSION) {
+            let (plain, decrypted, should_store) =
+                decrypt_str_or_original(&config.password, PASSWORD_ENC_VERSION);
+            if decrypted {
+                config.password = plain;
+                return Ok(());
+            }
+            if !should_store {
+                return Err(anyhow!("Invalid permanent password encrypted hash storage"));
+            }
+            return Ok(());
+        }
+
+        let (decrypted_storage, decrypted, _) =
+            decrypt_permanent_password_str_or_original(&config.password);
+        if decrypted {
+            Self::ensure_permanent_password_hash_salt(config)?;
+            if decode_permanent_password_h1_from_hashed_storage(&decrypted_storage).is_some() {
+                return Ok(());
+            }
+            return Err(anyhow!("Invalid permanent password encrypted hash storage"));
+        }
+
+        Ok(())
+    }
+
+    fn ensure_permanent_password_hash_salt(config: &Config) -> Result<()> {
+        if config.salt.is_empty() {
+            return Err(anyhow!(
+                "Permanent password hash storage requires a non-empty salt"
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_permanent_password_salt(config: &mut Config) {
+        if config.salt.is_empty() {
+            config.salt = Config::get_auto_password(DEFAULT_SALT_LEN);
+        }
+    }
+
+    fn prepare_config_for_store(config: &mut Config) {
+        match Self::validate_or_decrypt_permanent_password_storage(config) {
+            Ok(_) => {}
+            Err(err) => {
+                // This path is for unrecoverable permanent-password storage, such as
+                // hashed storage without its salt. Keep unrelated config writes working,
+                // but handle future transient migration errors separately.
+                log::error!(
+                    "Clearing invalid permanent password storage before storing config: {err}"
+                );
+                config.password.clear();
+                config.salt.clear();
+            }
+        }
+    }
+
     fn store(&self) {
         let mut config = self.clone();
-        config.password =
-            encrypt_str_or_original(&config.password, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
-        config.enc_id = encrypt_str_or_original(&config.id, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+        Self::prepare_config_for_store(&mut config);
+        if !config.password.is_empty()
+            && decode_permanent_password_h1_from_storage(&config.password).is_none()
+        {
+            let stored = Config::load_::<Config>("");
+            config.password =
+                keep_encrypted_storage_if_plaintext_unchanged(&config.password, &stored.password);
+        }
+        let (stored_id, encrypted, _) =
+            decrypt_str_or_original(&config.enc_id, PASSWORD_ENC_VERSION);
+        if !encrypted || stored_id != config.id {
+            config.enc_id =
+                encrypt_str_or_original(&config.id, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+        }
         config.id = "".to_owned();
         Config::store_(&config, "");
     }
@@ -597,6 +748,23 @@ impl Config {
         (self.id.is_empty() && self.enc_id.is_empty()) || self.key_pair.0.is_empty()
     }
 
+    /// Get the user's home directory for configuration purposes.
+    ///
+    /// # Security Note
+    /// This function uses `dirs_next::home_dir()` which reads the `$HOME` environment
+    /// variable on Unix systems. This is acceptable for user-space operations (config
+    /// file storage, logging) where the user may intentionally redirect their home
+    /// directory.
+    ///
+    /// **DO NOT use this function in privileged contexts** (e.g., code executed via
+    /// `gtk_sudo` or system services running as root). For privileged operations on
+    /// Linux, use `crate::platform::linux::get_home_dir_trusted()` which bypasses
+    /// the `$HOME` environment variable and queries the system password database
+    /// directly via `getpwuid`.
+    ///
+    /// Using `$HOME` in privileged contexts creates a confused-deputy vulnerability
+    /// where an attacker can manipulate the environment variable to inject malicious
+    /// paths into privileged operations.
     pub fn get_home() -> PathBuf {
         #[cfg(any(target_os = "android", target_os = "ios"))]
         return PathBuf::from(APP_HOME_DIR.read().unwrap().as_str());
@@ -637,6 +805,12 @@ impl Config {
         }
     }
 
+    /// Get the log directory path.
+    ///
+    /// # Security Note
+    /// On macOS, this function uses `dirs_next::home_dir()` which reads the `$HOME`
+    /// environment variable. On Linux/Android, it uses `Self::get_home()`.
+    /// See [`Self::get_home()`] for security considerations regarding `$HOME` usage.
     #[allow(unreachable_code)]
     pub fn log_path() -> PathBuf {
         #[cfg(target_os = "macos")]
@@ -682,17 +856,41 @@ impl Config {
         }
         #[cfg(not(windows))]
         {
+            #[cfg(target_os = "android")]
             use std::os::unix::fs::PermissionsExt;
             #[cfg(target_os = "android")]
             let mut path: PathBuf =
                 format!("{}/{}", *APP_DIR.read().unwrap(), *APP_NAME.read().unwrap()).into();
-            #[cfg(not(target_os = "android"))]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            let mut path: PathBuf = {
+                let uid = unsafe { libc::geteuid() as u32 };
+                ipc_parent_dir_for_uid(uid, postfix).into()
+            };
+            #[cfg(not(any(target_os = "android", target_os = "linux", target_os = "macos")))]
             let mut path: PathBuf = format!("/tmp/{}", *APP_NAME.read().unwrap()).into();
-            fs::create_dir(&path).ok();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o0777)).ok();
+            // Android stores IPC sockets under app-controlled directories. Create the IPC parent
+            // dir and enforce the expected mode here. On other Unix platforms, `ipc_path()` is
+            // intentionally side-effect free (no mkdir/chmod); callers should enforce directory and
+            // socket permissions at the IPC server boundary.
+            #[cfg(target_os = "android")]
+            {
+                fs::create_dir_all(&path).ok();
+                let path_mode = if is_service_ipc_postfix(postfix) {
+                    0o0711
+                } else {
+                    0o0700
+                };
+                fs::set_permissions(&path, fs::Permissions::from_mode(path_mode)).ok();
+            }
             path.push(format!("ipc{postfix}"));
             path.to_str().unwrap_or("").to_owned()
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn ipc_path_for_uid(uid: u32, postfix: &str) -> String {
+        let parent = ipc_parent_dir_for_uid(uid, postfix);
+        format!("{parent}/ipc{postfix}")
     }
 
     pub fn icon_path() -> PathBuf {
@@ -822,6 +1020,32 @@ impl Config {
         std::cmp::max(CONFIG2.read().unwrap().serial, SERIAL)
     }
 
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    fn gen_id() -> Option<String> {
+        Self::get_auto_id()
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn gen_id() -> Option<String> {
+        let hostname_as_id = BUILTIN_SETTINGS
+            .read()
+            .unwrap()
+            .get(keys::OPTION_ALLOW_HOSTNAME_AS_ID)
+            .map(|v| option2bool(keys::OPTION_ALLOW_HOSTNAME_AS_ID, v))
+            .unwrap_or(false);
+        if hostname_as_id {
+            match whoami::fallible::hostname() {
+                Ok(h) => Some(h.replace(" ", "-")),
+                Err(e) => {
+                    log::warn!("Failed to get hostname, \"{}\", fallback to auto id", e);
+                    Self::get_auto_id()
+                }
+            }
+        } else {
+            Self::get_auto_id()
+        }
+    }
+
     fn get_auto_id() -> Option<String> {
         #[cfg(any(target_os = "android", target_os = "ios"))]
         {
@@ -840,6 +1064,7 @@ impl Config {
                     id = (id << 8) | (*x as u32);
                 }
                 id &= 0x1FFFFFFF;
+                log::info!("Generated id {}", id);
                 Some(id.to_string())
             } else {
                 None
@@ -848,9 +1073,17 @@ impl Config {
     }
 
     pub fn get_auto_password(length: usize) -> String {
+        Self::get_auto_password_with_chars(length, CHARS)
+    }
+
+    pub fn get_auto_numeric_password(length: usize) -> String {
+        Self::get_auto_password_with_chars(length, NUM_CHARS)
+    }
+
+    fn get_auto_password_with_chars(length: usize, chars: &[char]) -> String {
         let mut rng = rand::thread_rng();
         (0..length)
-            .map(|_| CHARS[rng.gen::<usize>() % CHARS.len()])
+            .map(|_| chars[rng.gen::<usize>() % chars.len()])
             .collect()
     }
 
@@ -906,10 +1139,71 @@ impl Config {
         config.key_pair
     }
 
+    pub fn get_cached_pk() -> Option<Vec<u8>> {
+        KEY_PAIR.lock().unwrap().clone().map(|k| k.1)
+    }
+
+    /// Get existing key pair without generating a new one.
+    /// Returns None if no key pair exists in cache or config file.
+    pub fn get_existing_key_pair() -> Option<KeyPair> {
+        let mut lock = KEY_PAIR.lock().unwrap();
+        if let Some(p) = lock.as_ref() {
+            return Some(p.clone());
+        }
+
+        // IMPORTANT: this path is called while holding KEY_PAIR lock.
+        // Config::load_ must remain a raw conf load/deserialize path and must never
+        // call decrypt_* / symmetric_crypt (directly or indirectly), otherwise this
+        // can re-enter key loading and deadlock.
+        let config = Config::load_::<Config>("");
+        if !config.key_pair.0.is_empty() {
+            *lock = Some(config.key_pair.clone());
+            Some(config.key_pair)
+        } else {
+            None
+        }
+    }
+
+    pub fn no_register_device() -> bool {
+        BUILTIN_SETTINGS
+            .read()
+            .unwrap()
+            .get(keys::OPTION_REGISTER_DEVICE)
+            .map(|v| v == "N")
+            .unwrap_or(false)
+    }
+
+    pub fn is_disable_change_permanent_password() -> bool {
+        BUILTIN_SETTINGS
+            .read()
+            .unwrap()
+            .get(keys::OPTION_DISABLE_CHANGE_PERMANENT_PASSWORD)
+            .map(|v| v == "Y")
+            .unwrap_or(false)
+    }
+
+    pub fn is_disable_change_id() -> bool {
+        BUILTIN_SETTINGS
+            .read()
+            .unwrap()
+            .get(keys::OPTION_DISABLE_CHANGE_ID)
+            .map(|v| v == "Y")
+            .unwrap_or(false)
+    }
+
+    pub fn is_disable_unlock_pin() -> bool {
+        BUILTIN_SETTINGS
+            .read()
+            .unwrap()
+            .get(keys::OPTION_DISABLE_UNLOCK_PIN)
+            .map(|v| v == "Y")
+            .unwrap_or(false)
+    }
+
     pub fn get_id() -> String {
         let mut id = CONFIG.read().unwrap().id.clone();
         if id.is_empty() {
-            if let Some(tmp) = Config::get_auto_id() {
+            if let Some(tmp) = Config::gen_id() {
                 id = tmp;
                 Config::set_id(&id);
             }
@@ -964,6 +1258,10 @@ impl Config {
 
     pub fn set_option(k: String, v: String) {
         if !is_option_can_save(&OVERWRITE_SETTINGS, &k, &DEFAULT_SETTINGS, &v) {
+            let mut config = CONFIG2.write().unwrap();
+            if config.options.remove(&k).is_some() {
+                config.store();
+            }
             return;
         }
         let mut config = CONFIG2.write().unwrap();
@@ -987,56 +1285,235 @@ impl Config {
         log::info!("id updated from {} to {}", id, new_id);
     }
 
-    pub fn set_permanent_password(password: &str) {
-        if HARD_SETTINGS
-            .read()
-            .unwrap()
-            .get("password")
-            .map_or(false, |v| v == password)
+    /// Sets the local permanent password.
+    ///
+    /// Returns `true` when the password is accepted or already matches the effective
+    /// preset password. Returns `false` when changing the password is disabled or
+    /// the new password cannot be prepared for storage.
+    pub fn set_permanent_password(password: &str) -> bool {
+        if Self::is_disable_change_permanent_password() {
+            return false;
+        }
+        let (preset_storage, preset_salt) = Self::get_preset_password_storage_and_salt();
+        if preset_permanent_password_storage_matches_plain(&preset_storage, &preset_salt, password)
         {
-            return;
-        }
-        let mut config = CONFIG.write().unwrap();
-        if password == config.password {
-            return;
-        }
-        config.password = password.into();
-        config.store();
-        Self::clear_trusted_devices();
-    }
-
-    pub fn get_permanent_password() -> String {
-        let mut password = CONFIG.read().unwrap().password.clone();
-        if password.is_empty() {
-            if let Some(v) = HARD_SETTINGS.read().unwrap().get("password") {
-                password = v.to_owned();
+            if CONFIG.read().unwrap().password.is_empty() {
+                return true;
             }
         }
-        password
+
+        let mut config = CONFIG.write().unwrap();
+
+        let stored = if password.is_empty() {
+            Some(String::new())
+        } else {
+            Self::compute_permanent_password_storage_for_update(&mut config, password)
+        };
+        let Some(stored) = stored else {
+            log::error!("Failed to compute permanent password storage; refusing update");
+            return false;
+        };
+        if stored == config.password {
+            return true;
+        }
+        config.password = stored;
+        config.store();
+        Self::clear_trusted_devices();
+        true
     }
 
+    fn compute_permanent_password_storage_for_update(
+        config: &mut Config,
+        password: &str,
+    ) -> Option<String> {
+        // Keep salt stable for user-initiated permanent password updates.
+        // Salt should only change when service->user sync updates storage and salt as a pair.
+        Self::ensure_permanent_password_salt(config);
+        let h1 = compute_permanent_password_h1(password, &config.salt);
+        encode_permanent_password_encrypted_storage_from_h1(&h1)
+    }
+
+    /// Returns the locally persisted permanent password storage and salt (NOT the hard/preset one).
+    ///
+    /// This function is side-effect free:
+    /// - It does NOT call `get_salt()` (which may auto-generate salt).
+    /// - It returns a consistent snapshot under a single lock.
+    pub fn get_local_permanent_password_storage_and_salt() -> (String, String) {
+        let config = CONFIG.read().unwrap();
+        (config.password.clone(), config.salt.clone())
+    }
+
+    /// Persist permanent password storage and salt from service->user config sync.
+    pub fn set_permanent_password_storage_for_sync(
+        storage: &str,
+        salt: &str,
+    ) -> crate::ResultType<bool> {
+        let mut config = CONFIG.write().unwrap();
+        if !Self::apply_permanent_password_storage_for_sync(&mut config, storage, salt)? {
+            return Ok(false);
+        }
+
+        config.store();
+        Self::clear_trusted_devices();
+        Ok(true)
+    }
+
+    fn apply_permanent_password_storage_for_sync(
+        config: &mut Config,
+        storage: &str,
+        salt: &str,
+    ) -> Result<bool> {
+        if storage.is_empty() {
+            if config.password.is_empty() && (salt.is_empty() || config.salt == salt) {
+                return Ok(false);
+            }
+            config.password.clear();
+            if !salt.is_empty() {
+                config.salt = salt.to_owned();
+            }
+            return Ok(true);
+        }
+        if salt.is_empty() {
+            return Err(anyhow!(
+                "Refusing to persist permanent password storage without salt"
+            ));
+        }
+        if decode_permanent_password_h1_from_storage(storage).is_none() {
+            log::error!("Rejecting non-current permanent password storage sync payload");
+            return Err(anyhow!("Invalid permanent password storage sync payload"));
+        }
+        if config.password == storage && config.salt == salt {
+            return Ok(false);
+        }
+
+        config.password = storage.to_owned();
+        config.salt = salt.to_owned();
+        Ok(true)
+    }
+
+    pub fn has_permanent_password() -> bool {
+        let (local_storage, local_salt) = Self::get_local_permanent_password_storage_and_salt();
+        if !local_storage.is_empty() {
+            return local_permanent_password_storage_is_usable_for_auth(
+                &local_storage,
+                &local_salt,
+            );
+        }
+        Self::has_usable_preset_password()
+    }
+
+    fn has_usable_preset_password() -> bool {
+        let (preset_storage, preset_salt) = Self::get_preset_password_storage_and_salt();
+        preset_permanent_password_storage_is_usable_for_auth(&preset_storage, &preset_salt)
+    }
+
+    pub fn is_using_preset_password() -> bool {
+        let (local_storage, _) = Self::get_local_permanent_password_storage_and_salt();
+        local_storage.is_empty() && Self::has_usable_preset_password()
+    }
+
+    pub fn get_preset_password_storage_and_salt() -> (String, String) {
+        let hard_settings = HARD_SETTINGS.read().unwrap();
+        let storage = hard_settings.get("password").cloned().unwrap_or_default();
+        let salt = hard_settings.get("salt").cloned().unwrap_or_default();
+        (storage, salt)
+    }
+
+    pub fn get_effective_permanent_password_salt() -> String {
+        let (local_storage, local_salt) = Self::get_local_permanent_password_storage_and_salt();
+        if !local_storage.is_empty() {
+            if local_permanent_password_storage_is_usable_for_auth(&local_storage, &local_salt) {
+                return Self::get_salt();
+            }
+            return String::new();
+        }
+        let (preset_storage, preset_salt) = Self::get_preset_password_storage_and_salt();
+        if !preset_salt.is_empty() {
+            if preset_permanent_password_storage_is_usable_for_auth(&preset_storage, &preset_salt) {
+                return preset_salt;
+            }
+            return String::new();
+        }
+        Self::get_salt()
+    }
+
+    pub fn has_local_permanent_password() -> bool {
+        let (local_storage, local_salt) = Self::get_local_permanent_password_storage_and_salt();
+        local_permanent_password_storage_is_usable_for_auth(&local_storage, &local_salt)
+    }
+
+    // This shouldn't happen under normal circumstances because the salt
+    // should be automatically generated when migrating to hash storage.
+    // Actually, it is better to avoid calling set_salt at all.
     pub fn set_salt(salt: &str) {
         let mut config = CONFIG.write().unwrap();
         if salt == config.salt {
             return;
+        }
+        if !password_is_empty_or_not_hashed(&config.password) {
+            if config.salt.is_empty() {
+                log::warn!("Salt is empty but permanent password is hashed and salt is empty");
+            } else {
+                log::error!("Refusing to set salt because permanent password is hashed");
+                return;
+            }
         }
         config.salt = salt.into();
         config.store();
     }
 
     pub fn get_salt() -> String {
-        let mut salt = CONFIG.read().unwrap().salt.clone();
+        let config = CONFIG.read().unwrap();
+        let mut salt = config.salt.clone();
         if salt.is_empty() {
-            salt = Config::get_auto_password(6);
+            drop(config);
+            salt = Config::get_auto_password(DEFAULT_SALT_LEN);
             Config::set_salt(&salt);
         }
         salt
     }
 
     pub fn set_socks(socks: Option<Socks5Server>) {
+        if OVERWRITE_SETTINGS
+            .read()
+            .unwrap()
+            .contains_key(keys::OPTION_PROXY_URL)
+        {
+            return;
+        }
+
         let mut config = CONFIG2.write().unwrap();
         if config.socks == socks {
             return;
+        }
+        if config.socks.is_none() {
+            let equal_to_default = |key: &str, value: &str| {
+                DEFAULT_SETTINGS
+                    .read()
+                    .unwrap()
+                    .get(key)
+                    .map_or(false, |x| *x == value)
+            };
+            let contains_url = DEFAULT_SETTINGS
+                .read()
+                .unwrap()
+                .get(keys::OPTION_PROXY_URL)
+                .is_some();
+            let url = equal_to_default(
+                keys::OPTION_PROXY_URL,
+                &socks.clone().unwrap_or_default().proxy,
+            );
+            let username = equal_to_default(
+                keys::OPTION_PROXY_USERNAME,
+                &socks.clone().unwrap_or_default().username,
+            );
+            let password = equal_to_default(
+                keys::OPTION_PROXY_PASSWORD,
+                &socks.clone().unwrap_or_default().password,
+            );
+            if contains_url && url && username && password {
+                return;
+            }
         }
         config.socks = socks;
         config.store();
@@ -1097,10 +1574,16 @@ impl Config {
     }
 
     pub fn get_unlock_pin() -> String {
+        if Self::is_disable_unlock_pin() {
+            return String::new();
+        }
         CONFIG2.read().unwrap().unlock_pin.clone()
     }
 
     pub fn set_unlock_pin(pin: &str) {
+        if Self::is_disable_unlock_pin() {
+            return;
+        }
         let mut config = CONFIG2.write().unwrap();
         if pin == config.unlock_pin {
             return;
@@ -1171,6 +1654,8 @@ impl Config {
         return CONFIG.read().unwrap().clone();
     }
 
+    // TODO: `Config::set()` does not invalidate trusted devices when permanent password/salt changes.
+    // This matches historical behavior, but may need revisiting in a separate PR.
     pub fn set(cfg: Config) -> bool {
         let mut lock = CONFIG.write().unwrap();
         if *lock == cfg {
@@ -1178,7 +1663,29 @@ impl Config {
         }
         *lock = cfg;
         lock.store();
+        // Drop CONFIG lock before acquiring KEY_PAIR lock to avoid potential deadlock.
+        #[cfg(target_os = "macos")]
+        let new_key_pair = lock.key_pair.clone();
+        drop(lock);
+        #[cfg(target_os = "macos")]
+        Self::invalidate_key_pair_cache_if_changed(&new_key_pair);
         true
+    }
+
+    /// Invalidate KEY_PAIR cache if it differs from the new key_pair.
+    /// Use None to invalidate the cache instead of Some(key_pair).
+    /// If we use Some with an empty key_pair, get_key_pair() would always return
+    /// the empty key_pair from cache without regenerating.
+    /// By clearing the cache, get_key_pair() will reload and regenerate if needed.
+    #[cfg(target_os = "macos")]
+    fn invalidate_key_pair_cache_if_changed(new_key_pair: &KeyPair) {
+        let mut key_pair_cache = KEY_PAIR.lock().unwrap();
+        if let Some(cached) = key_pair_cache.as_ref() {
+            if cached != new_key_pair {
+                *key_pair_cache = None;
+                log::info!("key pair cache invalidated");
+            }
+        }
     }
 
     fn with_extension(path: PathBuf) -> PathBuf {
@@ -1476,11 +1983,10 @@ impl PeerConfig {
 
     fn default_options() -> HashMap<String, String> {
         let mut mp: HashMap<String, String> = Default::default();
-        [
+        let _ = [
             keys::OPTION_CODEC_PREFERENCE,
             keys::OPTION_CUSTOM_FPS,
             keys::OPTION_ZOOM_CURSOR,
-            keys::OPTION_TOUCH_MODE,
             keys::OPTION_I444,
             keys::OPTION_SWAP_LEFT_RIGHT_MOUSE,
             keys::OPTION_COLLAPSE_TOOLBAR,
@@ -1489,6 +1995,42 @@ impl PeerConfig {
             mp.insert(key.to_owned(), UserDefaultConfig::read(key));
         });
         mp
+    }
+
+    fn default_trackpad_speed() -> i32 {
+        UserDefaultConfig::read(keys::OPTION_TRACKPAD_SPEED)
+            .parse()
+            .unwrap_or(100)
+    }
+
+    fn deserialize_trackpad_speed<'de, D>(deserializer: D) -> Result<i32, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        let v: i32 = de::Deserialize::deserialize(deserializer)?;
+        if v >= 10 && v <= 1000 {
+            Ok(v)
+        } else {
+            Ok(Self::default_trackpad_speed())
+        }
+    }
+
+    fn default_edge_scroll_edge_thickness() -> i32 {
+        UserDefaultConfig::read(keys::OPTION_EDGE_SCROLL_EDGE_THICKNESS)
+            .parse()
+            .unwrap_or(100)
+    }
+
+    fn deserialize_edge_scroll_edge_thickness<'de, D>(deserializer: D) -> Result<i32, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        let v: i32 = de::Deserialize::deserialize(deserializer)?;
+        if v >= 20 && v <= 150 {
+            Ok(v)
+        } else {
+            Ok(Self::default_edge_scroll_edge_thickness())
+        }
     }
 }
 
@@ -1542,6 +2084,12 @@ serde_field_bool!(
     "LockAfterSessionEnd::default_lock_after_session_end"
 );
 serde_field_bool!(
+    TerminalPersistent,
+    "terminal-persistent",
+    default_terminal_persistent,
+    "TerminalPersistent::default_terminal_persistent"
+);
+serde_field_bool!(
     PrivacyMode,
     "privacy_mode",
     default_privacy_mode,
@@ -1560,6 +2108,13 @@ serde_field_bool!(
     "view_only",
     default_view_only,
     "ViewOnly::default_view_only"
+);
+
+serde_field_bool!(
+    ShowMyCursor,
+    "show_my_cursor",
+    default_show_my_cursor,
+    "ShowMyCursor::default_show_my_cursor"
 );
 
 serde_field_bool!(
@@ -1672,6 +2227,10 @@ impl LocalConfig {
 
     pub fn set_option(k: String, v: String) {
         if !is_option_can_save(&OVERWRITE_LOCAL_SETTINGS, &k, &DEFAULT_LOCAL_SETTINGS, &v) {
+            let mut config = LOCAL_CONFIG.write().unwrap();
+            if config.options.remove(&k).is_some() {
+                config.store();
+            }
             return;
         }
         let mut config = LOCAL_CONFIG.write().unwrap();
@@ -1807,18 +2366,20 @@ impl UserDefaultConfig {
             keys::OPTION_VIEW_STYLE => self.get_string(key, "adaptive", vec!["original"]),
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             keys::OPTION_VIEW_STYLE => self.get_string(key, "original", vec!["adaptive"]),
-            keys::OPTION_SCROLL_STYLE => self.get_string(key, "scrollauto", vec!["scrollbar"]),
+            keys::OPTION_SCROLL_STYLE => {
+                self.get_string(key, "scrollauto", vec!["scrolledge", "scrollbar"])
+            }
             keys::OPTION_IMAGE_QUALITY => {
                 self.get_string(key, "balanced", vec!["best", "low", "custom"])
             }
             keys::OPTION_CODEC_PREFERENCE => {
                 self.get_string(key, "auto", vec!["vp8", "vp9", "av1", "h264", "h265"])
             }
-            keys::OPTION_CUSTOM_IMAGE_QUALITY => {
-                self.get_double_string(key, 50.0, 10.0, 0xFFF as f64)
-            }
-            keys::OPTION_CUSTOM_FPS => self.get_double_string(key, 30.0, 5.0, 120.0),
+            keys::OPTION_CUSTOM_IMAGE_QUALITY => self.get_num_string(key, 50.0, 10.0, 0xFFF as f64),
+            keys::OPTION_CUSTOM_FPS => self.get_num_string(key, 30.0, 5.0, 120.0),
             keys::OPTION_ENABLE_FILE_COPY_PASTE => self.get_string(key, "Y", vec!["", "N"]),
+            keys::OPTION_EDGE_SCROLL_EDGE_THICKNESS => self.get_num_string(key, 100, 20, 150),
+            keys::OPTION_TRACKPAD_SPEED => self.get_num_string(key, 100, 10, 1000),
             _ => self
                 .get_after(key)
                 .map(|v| v.to_string())
@@ -1833,6 +2394,9 @@ impl UserDefaultConfig {
             &DEFAULT_DISPLAY_SETTINGS,
             &value,
         ) {
+            if self.options.remove(&key).is_some() {
+                self.store();
+            }
             return;
         }
         if value.is_empty() {
@@ -1858,10 +2422,13 @@ impl UserDefaultConfig {
     }
 
     #[inline]
-    fn get_double_string(&self, key: &str, default: f64, min: f64, max: f64) -> String {
+    fn get_num_string<T>(&self, key: &str, default: T, min: T, max: T) -> String
+    where
+        T: ToString + std::str::FromStr + std::cmp::PartialOrd + std::marker::Copy,
+    {
         match self.get_after(key) {
             Some(option) => {
-                let v: f64 = option.parse().unwrap_or(default);
+                let v: T = option.parse().unwrap_or(default);
                 if v >= min && v <= max {
                     v.to_string()
                 } else {
@@ -2064,6 +2631,12 @@ pub struct GroupUser {
         skip_serializing_if = "String::is_empty"
     )]
     pub name: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_string",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub display_name: String,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
@@ -2267,6 +2840,16 @@ pub fn option2bool(option: &str, value: &str) -> bool {
     }
 }
 
+pub fn use_ws() -> bool {
+    let option = keys::OPTION_ALLOW_WEBSOCKET;
+    option2bool(option, &Config::get_option(option))
+}
+
+pub fn allow_insecure_tls_fallback() -> bool {
+    let option = keys::OPTION_ALLOW_INSECURE_TLS_FALLBACK;
+    option2bool(option, &Config::get_option(option))
+}
+
 pub mod keys {
     pub const OPTION_VIEW_ONLY: &str = "view_only";
     pub const OPTION_SHOW_MONITORS_TOOLBAR: &str = "show_monitors_toolbar";
@@ -2277,6 +2860,7 @@ pub mod keys {
     pub const OPTION_ZOOM_CURSOR: &str = "zoom-cursor";
     pub const OPTION_SHOW_QUALITY_MONITOR: &str = "show_quality_monitor";
     pub const OPTION_DISABLE_AUDIO: &str = "disable_audio";
+    pub const OPTION_ENABLE_REMOTE_PRINTER: &str = "enable-remote-printer";
     pub const OPTION_ENABLE_FILE_COPY_PASTE: &str = "enable-file-copy-paste";
     pub const OPTION_DISABLE_CLIPBOARD: &str = "disable_clipboard";
     pub const OPTION_LOCK_AFTER_SESSION_END: &str = "lock_after_session_end";
@@ -2290,6 +2874,7 @@ pub mod keys {
         "use_all_my_displays_for_the_remote_session";
     pub const OPTION_VIEW_STYLE: &str = "view_style";
     pub const OPTION_SCROLL_STYLE: &str = "scroll_style";
+    pub const OPTION_EDGE_SCROLL_EDGE_THICKNESS: &str = "edge-scroll-edge-thickness";
     pub const OPTION_IMAGE_QUALITY: &str = "image_quality";
     pub const OPTION_CUSTOM_IMAGE_QUALITY: &str = "custom_image_quality";
     pub const OPTION_CUSTOM_FPS: &str = "custom-fps";
@@ -2304,7 +2889,9 @@ pub mod keys {
     pub const OPTION_ENABLE_OPEN_NEW_CONNECTIONS_IN_TABS: &str =
         "enable-open-new-connections-in-tabs";
     pub const OPTION_TEXTURE_RENDER: &str = "use-texture-render";
+    pub const OPTION_ALLOW_D3D_RENDER: &str = "allow-d3d-render";
     pub const OPTION_ENABLE_CHECK_UPDATE: &str = "enable-check-update";
+    pub const OPTION_ALLOW_AUTO_UPDATE: &str = "allow-auto-update";
     pub const OPTION_SYNC_AB_WITH_RECENT_SESSIONS: &str = "sync-ab-with-recent-sessions";
     pub const OPTION_SYNC_AB_TAGS: &str = "sync-ab-tags";
     pub const OPTION_FILTER_AB_BY_INTERSECTION: &str = "filter-ab-by-intersection";
@@ -2313,16 +2900,25 @@ pub mod keys {
     pub const OPTION_ENABLE_CLIPBOARD: &str = "enable-clipboard";
     pub const OPTION_ENABLE_FILE_TRANSFER: &str = "enable-file-transfer";
     pub const OPTION_ENABLE_CAMERA: &str = "enable-camera";
+    pub const OPTION_ENABLE_TERMINAL: &str = "enable-terminal";
+    pub const OPTION_TERMINAL_PERSISTENT: &str = "terminal-persistent";
     pub const OPTION_ENABLE_AUDIO: &str = "enable-audio";
     pub const OPTION_ENABLE_TUNNEL: &str = "enable-tunnel";
     pub const OPTION_ENABLE_REMOTE_RESTART: &str = "enable-remote-restart";
     pub const OPTION_ENABLE_RECORD_SESSION: &str = "enable-record-session";
     pub const OPTION_ENABLE_BLOCK_INPUT: &str = "enable-block-input";
+    pub const OPTION_ENABLE_PRIVACY_MODE: &str = "enable-privacy-mode";
+    pub const OPTION_ENABLE_PERM_CHANGE_IN_ACCEPT_WINDOW: &str =
+        "enable-perm-change-in-accept-window";
+    pub const OPTION_ALLOW_SCOPE_VIOLATION_CLOSE: &str = "allow-scope-violation-close";
+    pub const OPTION_ALLOW_SCOPE_VIOLATION_ALARM: &str = "allow-scope-violation-alarm";
     pub const OPTION_ALLOW_REMOTE_CONFIG_MODIFICATION: &str = "allow-remote-config-modification";
+    pub const OPTION_ALLOW_NUMERNIC_ONE_TIME_PASSWORD: &str = "allow-numeric-one-time-password";
     pub const OPTION_ENABLE_LAN_DISCOVERY: &str = "enable-lan-discovery";
     pub const OPTION_DIRECT_SERVER: &str = "direct-server";
     pub const OPTION_DIRECT_ACCESS_PORT: &str = "direct-access-port";
     pub const OPTION_WHITELIST: &str = "whitelist";
+    pub const OPTION_ID_WHITELIST: &str = "id-whitelist";
     pub const OPTION_ALLOW_AUTO_DISCONNECT: &str = "allow-auto-disconnect";
     pub const OPTION_AUTO_DISCONNECT_TIMEOUT: &str = "auto-disconnect-timeout";
     pub const OPTION_ALLOW_ONLY_CONN_WINDOW_OPEN: &str = "allow-only-conn-window-open";
@@ -2336,20 +2932,50 @@ pub mod keys {
     pub const OPTION_ENABLE_HWCODEC: &str = "enable-hwcodec";
     pub const OPTION_APPROVE_MODE: &str = "approve-mode";
     pub const OPTION_VERIFICATION_METHOD: &str = "verification-method";
+    pub const OPTION_TEMPORARY_PASSWORD_LENGTH: &str = "temporary-password-length";
     pub const OPTION_CUSTOM_RENDEZVOUS_SERVER: &str = "custom-rendezvous-server";
     pub const OPTION_API_SERVER: &str = "api-server";
     pub const OPTION_KEY: &str = "key";
+    pub const OPTION_ALLOW_WEBSOCKET: &str = "allow-websocket";
     pub const OPTION_PRESET_ADDRESS_BOOK_NAME: &str = "preset-address-book-name";
     pub const OPTION_PRESET_ADDRESS_BOOK_TAG: &str = "preset-address-book-tag";
+    pub const OPTION_PRESET_ADDRESS_BOOK_ALIAS: &str = "preset-address-book-alias";
+    pub const OPTION_PRESET_ADDRESS_BOOK_PASSWORD: &str = "preset-address-book-password";
+    pub const OPTION_PRESET_ADDRESS_BOOK_NOTE: &str = "preset-address-book-note";
+    pub const OPTION_PRESET_DEVICE_USERNAME: &str = "preset-device-username";
+    pub const OPTION_PRESET_DEVICE_NAME: &str = "preset-device-name";
+    pub const OPTION_PRESET_NOTE: &str = "preset-note";
     pub const OPTION_ENABLE_DIRECTX_CAPTURE: &str = "enable-directx-capture";
     pub const OPTION_ENABLE_ANDROID_SOFTWARE_ENCODING_HALF_SCALE: &str =
         "enable-android-software-encoding-half-scale";
     pub const OPTION_ENABLE_TRUSTED_DEVICES: &str = "enable-trusted-devices";
     pub const OPTION_AV1_TEST: &str = "av1-test";
-
-    // buildin options
-    pub const OPTION_DISPLAY_NAME: &str = "display-name";
+    pub const OPTION_TRACKPAD_SPEED: &str = "trackpad-speed";
+    pub const OPTION_REGISTER_DEVICE: &str = "register-device";
+    pub const OPTION_RELAY_SERVER: &str = "relay-server";
+    pub const OPTION_ICE_SERVERS: &str = "ice-servers";
+    /// Maximum number of files allowed during a single file transfer request.
+    ///
+    /// Key: `file-transfer-max-files`.
+    /// Unit: number of files (not bytes).
+    ///
+    /// Behaviour:
+    /// - If set to a positive integer N, at most N files are allowed.
+    /// - If set to 0, a safe built-in default is used (see DEFAULT_MAX_VALIDATED_FILES).
+    /// - If unset, negative, or non-integer, no explicit limit is enforced for backward compatibility.
+    pub const OPTION_FILE_TRANSFER_MAX_FILES: &str = "file-transfer-max-files";
     pub const OPTION_DISABLE_UDP: &str = "disable-udp";
+    pub const OPTION_ALLOW_INSECURE_TLS_FALLBACK: &str = "allow-insecure-tls-fallback";
+    pub const OPTION_SHOW_VIRTUAL_MOUSE: &str = "show-virtual-mouse";
+    // joystick is the virtual mouse.
+    // So `OPTION_SHOW_VIRTUAL_MOUSE` should also be set if `OPTION_SHOW_VIRTUAL_JOYSTICK` is set.
+    pub const OPTION_SHOW_VIRTUAL_JOYSTICK: &str = "show-virtual-joystick";
+    pub const OPTION_ENABLE_FLUTTER_HTTP_ON_RUST: &str = "enable-flutter-http-on-rust";
+    pub const OPTION_ALLOW_ASK_FOR_NOTE: &str = "allow-ask-for-note";
+
+    // built-in options
+    pub const OPTION_DISPLAY_NAME: &str = "display-name";
+    pub const OPTION_AVATAR: &str = "avatar";
     pub const OPTION_PRESET_DEVICE_GROUP_NAME: &str = "preset-device-group-name";
     pub const OPTION_PRESET_USERNAME: &str = "preset-user-name";
     pub const OPTION_PRESET_STRATEGY_NAME: &str = "preset-strategy-name";
@@ -2358,14 +2984,32 @@ pub mod keys {
     pub const OPTION_HIDE_NETWORK_SETTINGS: &str = "hide-network-settings";
     pub const OPTION_HIDE_SERVER_SETTINGS: &str = "hide-server-settings";
     pub const OPTION_HIDE_PROXY_SETTINGS: &str = "hide-proxy-settings";
+    pub const OPTION_HIDE_REMOTE_PRINTER_SETTINGS: &str = "hide-remote-printer-settings";
+    pub const OPTION_HIDE_WEBSOCKET_SETTINGS: &str = "hide-websocket-settings";
+    pub const OPTION_HIDE_STOP_SERVICE: &str = "hide-stop-service";
+    pub const OPTION_ALLOW_COMMAND_LINE_SETTINGS_WHEN_SETTINGS_DISABLED: &str =
+        "allow-command-line-settings-when-settings-disabled";
+
+    // Connection punch-through options
+    pub const OPTION_ENABLE_UDP_PUNCH: &str = "enable-udp-punch";
+    pub const OPTION_ENABLE_IPV6_PUNCH: &str = "enable-ipv6-punch";
     pub const OPTION_HIDE_USERNAME_ON_CARD: &str = "hide-username-on-card";
     pub const OPTION_HIDE_HELP_CARDS: &str = "hide-help-cards";
     pub const OPTION_DEFAULT_CONNECT_PASSWORD: &str = "default-connect-password";
     pub const OPTION_HIDE_TRAY: &str = "hide-tray";
     pub const OPTION_ONE_WAY_CLIPBOARD_REDIRECTION: &str = "one-way-clipboard-redirection";
     pub const OPTION_ALLOW_LOGON_SCREEN_PASSWORD: &str = "allow-logon-screen-password";
+    pub const OPTION_ALLOW_DEEP_LINK_PASSWORD: &str = "allow-deep-link-password";
+    pub const OPTION_ALLOW_DEEP_LINK_SERVER_SETTINGS: &str = "allow-deep-link-server-settings";
     pub const OPTION_ONE_WAY_FILE_TRANSFER: &str = "one-way-file-transfer";
     pub const OPTION_ALLOW_HTTPS_21114: &str = "allow-https-21114";
+    pub const OPTION_USE_RAW_TCP_FOR_API: &str = "use-raw-tcp-for-api";
+    pub const OPTION_ALLOW_HOSTNAME_AS_ID: &str = "allow-hostname-as-id";
+    pub const OPTION_HIDE_POWERED_BY_ME: &str = "hide-powered-by-me";
+    pub const OPTION_MAIN_WINDOW_ALWAYS_ON_TOP: &str = "main-window-always-on-top";
+    pub const OPTION_DISABLE_CHANGE_PERMANENT_PASSWORD: &str = "disable-change-permanent-password";
+    pub const OPTION_DISABLE_CHANGE_ID: &str = "disable-change-id";
+    pub const OPTION_DISABLE_UNLOCK_PIN: &str = "disable-unlock-pin";
 
     // flutter local options
     pub const OPTION_FLUTTER_REMOTE_MENUBAR_STATE: &str = "remoteMenubarState";
@@ -2377,6 +3021,10 @@ pub mod keys {
     pub const OPTION_FLUTTER_CURRENT_AB_NAME: &str = "current-ab-name";
     pub const OPTION_ALLOW_REMOTE_CM_MODIFICATION: &str = "allow-remote-cm-modification";
 
+    pub const OPTION_PRINTER_INCOMING_JOB_ACTION: &str = "printer-incomming-job-action";
+    pub const OPTION_PRINTER_ALLOW_AUTO_PRINT: &str = "allow-printer-auto-print";
+    pub const OPTION_PRINTER_SELECTED_NAME: &str = "printer-selected-name";
+
     // android floating window options
     pub const OPTION_DISABLE_FLOATING_WINDOW: &str = "disable-floating-window";
     pub const OPTION_FLOATING_WINDOW_SIZE: &str = "floating-window-size";
@@ -2387,7 +3035,16 @@ pub mod keys {
     // android keep screen on
     pub const OPTION_KEEP_SCREEN_ON: &str = "keep-screen-on";
 
+    // Server-side: keep host system awake during incoming sessions (Security setting)
+    pub const OPTION_KEEP_AWAKE_DURING_INCOMING_SESSIONS: &str =
+        "keep-awake-during-incoming-sessions";
+
+    // Client-side: keep client system awake during outgoing sessions (General setting)
+    pub const OPTION_KEEP_AWAKE_DURING_OUTGOING_SESSIONS: &str =
+        "keep-awake-during-outgoing-sessions";
+
     pub const OPTION_DISABLE_GROUP_PANEL: &str = "disable-group-panel";
+    pub const OPTION_DISABLE_DISCOVERY_PANEL: &str = "disable-discovery-panel";
     pub const OPTION_PRE_ELEVATE_SERVICE: &str = "pre-elevate-service";
 
     // proxy settings
@@ -2419,12 +3076,15 @@ pub mod keys {
         OPTION_DISPLAYS_AS_INDIVIDUAL_WINDOWS,
         OPTION_USE_ALL_MY_DISPLAYS_FOR_THE_REMOTE_SESSION,
         OPTION_VIEW_STYLE,
+        OPTION_TERMINAL_PERSISTENT,
         OPTION_SCROLL_STYLE,
+        OPTION_EDGE_SCROLL_EDGE_THICKNESS,
         OPTION_IMAGE_QUALITY,
         OPTION_CUSTOM_IMAGE_QUALITY,
         OPTION_CUSTOM_FPS,
         OPTION_CODEC_PREFERENCE,
         OPTION_SYNC_INIT_CLIPBOARD,
+        OPTION_TRACKPAD_SPEED,
     ];
     // DEFAULT_LOCAL_SETTINGS, OVERWRITE_LOCAL_SETTINGS
     pub const KEYS_LOCAL_SETTINGS: &[&str] = &[
@@ -2433,6 +3093,7 @@ pub mod keys {
         OPTION_ENABLE_CONFIRM_CLOSING_TABS,
         OPTION_ENABLE_OPEN_NEW_CONNECTIONS_IN_TABS,
         OPTION_TEXTURE_RENDER,
+        OPTION_ALLOW_D3D_RENDER,
         OPTION_SYNC_AB_WITH_RECENT_SESSIONS,
         OPTION_SYNC_AB_TAGS,
         OPTION_FILTER_AB_BY_INTERSECTION,
@@ -2452,11 +3113,21 @@ pub mod keys {
         OPTION_FLOATING_WINDOW_TRANSPARENCY,
         OPTION_FLOATING_WINDOW_SVG,
         OPTION_KEEP_SCREEN_ON,
+        // Client-side: keep client system awake during outgoing sessions (General setting)
+        OPTION_KEEP_AWAKE_DURING_OUTGOING_SESSIONS,
         OPTION_DISABLE_GROUP_PANEL,
+        OPTION_DISABLE_DISCOVERY_PANEL,
         OPTION_PRE_ELEVATE_SERVICE,
         OPTION_ALLOW_REMOTE_CM_MODIFICATION,
         OPTION_ALLOW_AUTO_RECORD_OUTGOING,
         OPTION_VIDEO_SAVE_DIRECTORY,
+        OPTION_ENABLE_UDP_PUNCH,
+        OPTION_ENABLE_IPV6_PUNCH,
+        OPTION_TOUCH_MODE,
+        OPTION_SHOW_VIRTUAL_MOUSE,
+        OPTION_SHOW_VIRTUAL_JOYSTICK,
+        OPTION_ENABLE_FLUTTER_HTTP_ON_RUST,
+        OPTION_ALLOW_ASK_FOR_NOTE,
     ];
     // DEFAULT_SETTINGS, OVERWRITE_SETTINGS
     pub const KEYS_SETTINGS: &[&str] = &[
@@ -2465,16 +3136,23 @@ pub mod keys {
         OPTION_ENABLE_CLIPBOARD,
         OPTION_ENABLE_FILE_TRANSFER,
         OPTION_ENABLE_CAMERA,
+        OPTION_ENABLE_TERMINAL,
+        OPTION_ENABLE_REMOTE_PRINTER,
         OPTION_ENABLE_AUDIO,
         OPTION_ENABLE_TUNNEL,
         OPTION_ENABLE_REMOTE_RESTART,
         OPTION_ENABLE_RECORD_SESSION,
         OPTION_ENABLE_BLOCK_INPUT,
+        OPTION_ENABLE_PRIVACY_MODE,
+        OPTION_ALLOW_SCOPE_VIOLATION_CLOSE,
+        OPTION_ALLOW_SCOPE_VIOLATION_ALARM,
         OPTION_ALLOW_REMOTE_CONFIG_MODIFICATION,
+        OPTION_ALLOW_NUMERNIC_ONE_TIME_PASSWORD,
         OPTION_ENABLE_LAN_DISCOVERY,
         OPTION_DIRECT_SERVER,
         OPTION_DIRECT_ACCESS_PORT,
         OPTION_WHITELIST,
+        OPTION_ID_WHITELIST,
         OPTION_ALLOW_AUTO_DISCONNECT,
         OPTION_AUTO_DISCONNECT_TIMEOUT,
         OPTION_ALLOW_ONLY_CONN_WINDOW_OPEN,
@@ -2486,23 +3164,37 @@ pub mod keys {
         OPTION_ENABLE_HWCODEC,
         OPTION_APPROVE_MODE,
         OPTION_VERIFICATION_METHOD,
+        OPTION_TEMPORARY_PASSWORD_LENGTH,
         OPTION_PROXY_URL,
         OPTION_PROXY_USERNAME,
         OPTION_PROXY_PASSWORD,
         OPTION_CUSTOM_RENDEZVOUS_SERVER,
         OPTION_API_SERVER,
         OPTION_KEY,
+        OPTION_ALLOW_WEBSOCKET,
         OPTION_PRESET_ADDRESS_BOOK_NAME,
         OPTION_PRESET_ADDRESS_BOOK_TAG,
+        OPTION_PRESET_ADDRESS_BOOK_ALIAS,
+        OPTION_PRESET_ADDRESS_BOOK_PASSWORD,
+        OPTION_PRESET_ADDRESS_BOOK_NOTE,
+        OPTION_PRESET_DEVICE_USERNAME,
+        OPTION_PRESET_DEVICE_NAME,
+        OPTION_PRESET_NOTE,
         OPTION_ENABLE_DIRECTX_CAPTURE,
         OPTION_ENABLE_ANDROID_SOFTWARE_ENCODING_HALF_SCALE,
         OPTION_ENABLE_TRUSTED_DEVICES,
+        OPTION_RELAY_SERVER,
+        OPTION_ICE_SERVERS,
+        OPTION_DISABLE_UDP,
+        OPTION_ALLOW_INSECURE_TLS_FALLBACK,
+        OPTION_KEEP_AWAKE_DURING_INCOMING_SESSIONS,
+        OPTION_ALLOW_AUTO_UPDATE,
     ];
 
     // BUILDIN_SETTINGS
     pub const KEYS_BUILDIN_SETTINGS: &[&str] = &[
         OPTION_DISPLAY_NAME,
-        OPTION_DISABLE_UDP,
+        OPTION_AVATAR,
         OPTION_PRESET_DEVICE_GROUP_NAME,
         OPTION_PRESET_USERNAME,
         OPTION_PRESET_STRATEGY_NAME,
@@ -2511,14 +3203,30 @@ pub mod keys {
         OPTION_HIDE_NETWORK_SETTINGS,
         OPTION_HIDE_SERVER_SETTINGS,
         OPTION_HIDE_PROXY_SETTINGS,
+        OPTION_HIDE_REMOTE_PRINTER_SETTINGS,
+        OPTION_HIDE_WEBSOCKET_SETTINGS,
+        OPTION_HIDE_STOP_SERVICE,
         OPTION_HIDE_USERNAME_ON_CARD,
         OPTION_HIDE_HELP_CARDS,
         OPTION_DEFAULT_CONNECT_PASSWORD,
         OPTION_HIDE_TRAY,
         OPTION_ONE_WAY_CLIPBOARD_REDIRECTION,
         OPTION_ALLOW_LOGON_SCREEN_PASSWORD,
+        OPTION_ALLOW_DEEP_LINK_PASSWORD,
+        OPTION_ALLOW_DEEP_LINK_SERVER_SETTINGS,
         OPTION_ONE_WAY_FILE_TRANSFER,
         OPTION_ALLOW_HTTPS_21114,
+        OPTION_ALLOW_HOSTNAME_AS_ID,
+        OPTION_REGISTER_DEVICE,
+        OPTION_HIDE_POWERED_BY_ME,
+        OPTION_MAIN_WINDOW_ALWAYS_ON_TOP,
+        OPTION_FILE_TRANSFER_MAX_FILES,
+        OPTION_DISABLE_CHANGE_PERMANENT_PASSWORD,
+        OPTION_DISABLE_CHANGE_ID,
+        OPTION_DISABLE_UNLOCK_PIN,
+        OPTION_USE_RAW_TCP_FOR_API,
+        OPTION_ENABLE_PERM_CHANGE_IN_ACCEPT_WINDOW,
+        OPTION_ALLOW_COMMAND_LINE_SETTINGS_WHEN_SETTINGS_DISABLED,
     ];
 }
 
@@ -2572,7 +3280,72 @@ impl Status {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{permanent_password::PERMANENT_PASSWORD_ENC_VERSION, *};
+
+    static CONFIG_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct ConfigStateTestGuard {
+        original_config: Config,
+        original_hard_settings: HashMap<String, String>,
+    }
+
+    struct ConfigFileRestoreGuard {
+        path: PathBuf,
+        original_content: Option<Vec<u8>>,
+    }
+
+    impl ConfigStateTestGuard {
+        fn new(config: Config, hard_settings: HashMap<String, String>) -> Self {
+            let original_config = Config::get();
+            let original_hard_settings = HARD_SETTINGS.read().unwrap().clone();
+            *CONFIG.write().unwrap() = config;
+            *HARD_SETTINGS.write().unwrap() = hard_settings;
+            Self {
+                original_config,
+                original_hard_settings,
+            }
+        }
+    }
+
+    impl Drop for ConfigStateTestGuard {
+        fn drop(&mut self) {
+            *CONFIG.write().unwrap() = self.original_config.clone();
+            *HARD_SETTINGS.write().unwrap() = self.original_hard_settings.clone();
+        }
+    }
+
+    impl ConfigFileRestoreGuard {
+        fn new(path: PathBuf) -> Self {
+            let original_content = fs::read(&path).ok();
+            Self {
+                path,
+                original_content,
+            }
+        }
+    }
+
+    impl Drop for ConfigFileRestoreGuard {
+        fn drop(&mut self) {
+            if let Some(content) = &self.original_content {
+                if let Some(parent) = self.path.parent() {
+                    fs::create_dir_all(parent).ok();
+                }
+                fs::write(&self.path, content).ok();
+            } else {
+                fs::remove_file(&self.path).ok();
+            }
+        }
+    }
+
+    fn with_config_and_hard_settings<R>(
+        config: Config,
+        hard_settings: HashMap<String, String>,
+        test: impl FnOnce() -> R,
+    ) -> R {
+        let _guard = CONFIG_STATE_TEST_LOCK.lock().unwrap();
+        let _state_guard = ConfigStateTestGuard::new(config, hard_settings);
+        test()
+    }
 
     #[test]
     fn test_serialize() {
@@ -2582,6 +3355,393 @@ mod tests {
         let cfg: PeerConfig = Default::default();
         let res = toml::to_string_pretty(&cfg);
         assert!(res.is_ok());
+    }
+
+    #[test]
+    fn test_hbbs_00_hashed_preset_password_storage_matches_plain_with_salt() {
+        let salt = "salt123";
+        let h1 = compute_permanent_password_h1("p@ssw0rd", salt);
+        let storage = "00".to_owned() + &base64::encode(h1, base64::Variant::Original);
+        let hard_settings = HashMap::from([
+            ("password".to_owned(), storage),
+            ("salt".to_owned(), salt.to_owned()),
+        ]);
+
+        with_config_and_hard_settings(Config::default(), hard_settings, || {
+            assert!(Config::has_permanent_password());
+            assert!(Config::has_usable_preset_password());
+            assert!(Config::is_using_preset_password());
+            assert_eq!(Config::get_effective_permanent_password_salt(), salt);
+        });
+    }
+
+    #[test]
+    fn test_legacy_plain_preset_password_with_00_hash_shape_without_salt_keeps_old_behavior() {
+        let h1 = compute_permanent_password_h1("p@ssw0rd", "salt123");
+        let storage = "00".to_owned() + &base64::encode(h1, base64::Variant::Original);
+        let hard_settings = HashMap::from([("password".to_owned(), storage.clone())]);
+
+        let mut config = Config::default();
+        config.salt = "local1".to_owned();
+
+        with_config_and_hard_settings(config, hard_settings, || {
+            assert!(Config::has_permanent_password());
+            assert!(Config::has_usable_preset_password());
+            assert!(Config::is_using_preset_password());
+            assert_eq!(Config::get_effective_permanent_password_salt(), "local1");
+        });
+    }
+
+    #[test]
+    fn test_local_hashed_permanent_password_without_salt_is_not_reported_as_set() {
+        let h1 = compute_permanent_password_h1("p@ssw0rd", "salt123");
+        let mut config = Config::default();
+        config.password = encode_permanent_password_encrypted_storage_from_h1(&h1).unwrap();
+
+        with_config_and_hard_settings(config, HashMap::new(), || {
+            assert!(!Config::has_permanent_password());
+            assert!(!Config::has_local_permanent_password());
+            assert!(!Config::is_using_preset_password());
+        });
+    }
+
+    #[test]
+    fn test_invalid_local_hashed_password_does_not_generate_effective_salt() {
+        let h1 = compute_permanent_password_h1("p@ssw0rd", "salt123");
+        let mut config = Config::default();
+        config.password = encode_permanent_password_encrypted_storage_from_h1(&h1).unwrap();
+
+        with_config_and_hard_settings(config, HashMap::new(), || {
+            assert_eq!(Config::get_effective_permanent_password_salt(), "");
+            assert_eq!(
+                Config::get_local_permanent_password_storage_and_salt().1,
+                ""
+            );
+        });
+    }
+
+    #[test]
+    fn test_legacy_plain_preset_password_uses_local_salt_for_challenge() {
+        let mut config = Config::default();
+        config.salt = "local1".to_owned();
+        let hard_settings = HashMap::from([("password".to_owned(), "legacy-password".to_owned())]);
+
+        with_config_and_hard_settings(config, hard_settings, || {
+            assert_eq!(Config::get_effective_permanent_password_salt(), "local1");
+            assert!(Config::has_permanent_password());
+            assert!(Config::is_using_preset_password());
+        });
+    }
+
+    #[test]
+    fn test_malformed_preset_password_with_salt_is_not_usable() {
+        for storage in ["01secret", "00not-a-valid-hash"] {
+            let hard_settings = HashMap::from([
+                ("password".to_owned(), storage.to_owned()),
+                ("salt".to_owned(), "preset-salt".to_owned()),
+            ]);
+
+            with_config_and_hard_settings(Config::default(), hard_settings, || {
+                assert_eq!(Config::get_effective_permanent_password_salt(), "");
+                assert_eq!(
+                    Config::get_local_permanent_password_storage_and_salt().1,
+                    ""
+                );
+                assert!(!Config::has_permanent_password());
+                assert!(!Config::is_using_preset_password());
+            });
+        }
+    }
+
+    #[test]
+    fn test_validate_or_decrypt_keeps_plaintext_permanent_password_unchanged() {
+        let mut cfg = Config::default();
+        cfg.password = "p@ssw0rd".to_owned();
+        cfg.salt = "".to_owned();
+        Config::validate_or_decrypt_permanent_password_storage(&mut cfg).unwrap();
+        assert_eq!(cfg.password, "p@ssw0rd");
+        assert!(cfg.salt.is_empty());
+    }
+
+    #[test]
+    fn test_validate_or_decrypt_decrypts_00_permanent_password_without_forcing_store() {
+        let mut cfg = Config::default();
+        let legacy_storage =
+            encrypt_str_or_original("legacy-secret", PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+        cfg.password = legacy_storage;
+        cfg.salt = "".to_owned();
+        Config::validate_or_decrypt_permanent_password_storage(&mut cfg).unwrap();
+        assert_eq!(cfg.password, "legacy-secret");
+        assert!(cfg.salt.is_empty());
+    }
+
+    #[test]
+    fn test_validate_or_decrypt_rejects_corrupted_00_permanent_password_storage() {
+        let legacy_storage =
+            encrypt_str_or_original("legacy-secret", PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+        let mut invalid_payload = base64::decode(
+            &legacy_storage.as_bytes()[PASSWORD_ENC_VERSION.len()..],
+            base64::Variant::Original,
+        )
+        .unwrap();
+        *invalid_payload.last_mut().unwrap() ^= 1;
+
+        let mut cfg = Config::default();
+        cfg.password = PASSWORD_ENC_VERSION.to_owned()
+            + &base64::encode(invalid_payload, base64::Variant::Original);
+        cfg.salt = "salt123".to_owned();
+
+        assert!(Config::validate_or_decrypt_permanent_password_storage(&mut cfg).is_err());
+    }
+
+    #[test]
+    fn test_validate_or_decrypt_rejects_encrypted_hashed_permanent_password_without_salt() {
+        let mut cfg = Config::default();
+        let h1 = compute_permanent_password_h1("p@ssw0rd", "salt123");
+        cfg.password = encode_permanent_password_encrypted_storage_from_h1(&h1).unwrap();
+        let original_password = cfg.password.clone();
+
+        assert!(Config::validate_or_decrypt_permanent_password_storage(&mut cfg).is_err());
+        assert_eq!(cfg.password, original_password);
+        assert!(cfg.salt.is_empty());
+    }
+
+    #[test]
+    fn test_set_does_not_validate_or_decrypt_permanent_password_storage_in_memory() {
+        let mut cfg = Config::default();
+        let invalid_payload =
+            crate::password_security::symmetric_crypt(b"not-a-hash", true).unwrap();
+        let invalid_storage = PERMANENT_PASSWORD_ENC_VERSION.to_owned()
+            + &base64::encode(invalid_payload, base64::Variant::Original);
+        cfg.password = invalid_storage.clone();
+        cfg.id = "123456789".to_owned();
+
+        with_config_and_hard_settings(Config::default(), HashMap::new(), || {
+            assert!(Config::set(cfg));
+
+            let updated = Config::get();
+            assert_eq!(updated.password, invalid_storage);
+            assert!(updated.salt.is_empty());
+            assert_eq!(updated.id, "123456789");
+        });
+    }
+
+    #[test]
+    fn test_store_keeps_existing_enc_id_when_id_is_unchanged() {
+        let mut cfg = Config::default();
+        cfg.id = "123456789".to_owned();
+        cfg.enc_id = encrypt_str_or_original(&cfg.id, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+        let original_enc_id = cfg.enc_id.clone();
+
+        with_config_and_hard_settings(Config::default(), HashMap::new(), || {
+            assert!(Config::set(cfg));
+
+            assert_eq!(Config::load().enc_id, original_enc_id);
+            assert_eq!(Config::get().id, "123456789");
+        });
+    }
+
+    #[test]
+    fn test_store_rewrites_enc_id_when_id_changes() {
+        let original_id = "123456789";
+        let updated_id = "987654321";
+        let mut cfg = Config::default();
+        cfg.id = updated_id.to_owned();
+        let original_enc_id =
+            encrypt_str_or_original(original_id, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+        cfg.enc_id = original_enc_id.clone();
+
+        with_config_and_hard_settings(Config::default(), HashMap::new(), || {
+            assert!(Config::set(cfg));
+
+            let stored = Config::load().enc_id;
+            let (stored_id, encrypted, _) = decrypt_str_or_original(&stored, PASSWORD_ENC_VERSION);
+            assert_ne!(stored, original_enc_id);
+            assert!(encrypted);
+            assert_eq!(stored_id, updated_id);
+            assert_eq!(Config::get().id, updated_id);
+        });
+    }
+
+    #[test]
+    fn test_config2_store_keeps_existing_unlock_pin_when_pin_is_unchanged() {
+        let _guard = CONFIG_STATE_TEST_LOCK.lock().unwrap();
+        let _file_guard = ConfigFileRestoreGuard::new(Config::file_("2"));
+        let pin = "123456";
+        let original_unlock_pin =
+            encrypt_str_or_original(pin, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+        let mut cfg = Config2 {
+            unlock_pin: original_unlock_pin.clone(),
+            ..Default::default()
+        };
+        Config::store_(&cfg, "2");
+        let (unlock_pin, decrypted, _) =
+            decrypt_str_or_original(&cfg.unlock_pin, PASSWORD_ENC_VERSION);
+        assert!(decrypted);
+        cfg.unlock_pin = unlock_pin;
+        cfg.nat_type = 1;
+
+        cfg.store();
+
+        let stored = Config::load_::<Config2>("2");
+        assert_eq!(stored.unlock_pin, original_unlock_pin);
+    }
+
+    #[test]
+    fn test_set_does_not_convert_plaintext_permanent_password_to_storage_format_in_memory() {
+        let mut cfg = Config::default();
+        cfg.password = "legacy-secret".to_owned();
+        cfg.salt = "".to_owned();
+
+        with_config_and_hard_settings(Config::default(), HashMap::new(), || {
+            assert!(Config::set(cfg));
+
+            let updated = Config::get();
+            assert!(!updated.password.starts_with(PASSWORD_ENC_VERSION));
+            assert_eq!(updated.password, "legacy-secret");
+            assert!(updated.salt.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_set_keeps_plaintext_permanent_password_with_current_prefix_in_memory() {
+        let mut cfg = Config::default();
+        cfg.password = "01legacy-secret".to_owned();
+        cfg.salt = "".to_owned();
+
+        with_config_and_hard_settings(Config::default(), HashMap::new(), || {
+            assert!(Config::set(cfg));
+
+            let updated = Config::get();
+            assert_eq!(updated.password, "01legacy-secret");
+            assert!(updated.salt.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_validate_or_decrypt_keeps_plaintext_permanent_password_with_current_prefix_and_long_base64(
+    ) {
+        let mut cfg = Config::default();
+        let plain = "01".to_owned() + &base64::encode([42u8; 24], base64::Variant::Original);
+        cfg.password = plain.clone();
+        cfg.salt = "".to_owned();
+
+        Config::validate_or_decrypt_permanent_password_storage(&mut cfg).unwrap();
+        assert_eq!(cfg.password, plain);
+        assert!(cfg.salt.is_empty());
+    }
+
+    #[test]
+    fn test_permanent_password_sync_treats_same_encrypted_hash_as_unchanged() {
+        let mut cfg = Config::default();
+        cfg.salt = "salt123".to_owned();
+        let h1 = compute_permanent_password_h1("p@ssw0rd", &cfg.salt);
+        let encrypted_hash_storage =
+            encode_permanent_password_encrypted_storage_from_h1(&h1).unwrap();
+        cfg.password = encrypted_hash_storage.clone();
+        Config::validate_or_decrypt_permanent_password_storage(&mut cfg).unwrap();
+
+        assert!(!Config::apply_permanent_password_storage_for_sync(
+            &mut cfg,
+            &encrypted_hash_storage,
+            "salt123"
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn test_permanent_password_sync_stores_incoming_encrypted_hash_when_local_empty() {
+        let salt = "salt123";
+        let h1 = compute_permanent_password_h1("p@ssw0rd", salt);
+        let incoming = encode_permanent_password_encrypted_storage_from_h1(&h1).unwrap();
+        let mut cfg = Config::default();
+
+        assert!(
+            Config::apply_permanent_password_storage_for_sync(&mut cfg, &incoming, salt).unwrap()
+        );
+        assert_eq!(cfg.password, incoming);
+        assert_eq!(cfg.salt, salt);
+    }
+
+    #[test]
+    fn test_permanent_password_sync_rejects_non_current_storage_payloads() {
+        let invalid_payload = vec![42u8; sodiumoxide::crypto::secretbox::MACBYTES + 1];
+        let invalid_storage = PERMANENT_PASSWORD_ENC_VERSION.to_owned()
+            + &base64::encode(invalid_payload, base64::Variant::Original);
+        let encrypted_legacy_plaintext =
+            encrypt_str_or_original("legacy-secret", PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+
+        let encrypted = crate::password_security::symmetric_crypt(b"not-a-hash", true).unwrap();
+        let encrypted_non_hash = PERMANENT_PASSWORD_ENC_VERSION.to_owned()
+            + &base64::encode(encrypted, base64::Variant::Original);
+        for storage in [
+            "00secret",
+            &encrypted_legacy_plaintext,
+            &invalid_storage,
+            "01invalid",
+            &encrypted_non_hash,
+        ] {
+            let mut cfg = Config::default();
+            assert!(Config::apply_permanent_password_storage_for_sync(
+                &mut cfg, storage, "salt123"
+            )
+            .is_err());
+            assert!(cfg.password.is_empty());
+            assert!(cfg.salt.is_empty());
+        }
+
+        let mut cfg = Config::default();
+        cfg.password = invalid_storage.clone();
+        cfg.salt = "salt123".to_owned();
+        assert!(Config::apply_permanent_password_storage_for_sync(
+            &mut cfg,
+            &invalid_storage,
+            "salt123"
+        )
+        .is_err());
+        assert_eq!(cfg.password, invalid_storage);
+        assert_eq!(cfg.salt, "salt123");
+    }
+
+    #[test]
+    fn test_permanent_password_sync_rejects_non_empty_storage_without_salt() {
+        let mut cfg = Config::default();
+        let h1 = compute_permanent_password_h1("p@ssw0rd", "salt123");
+        let incoming = encode_permanent_password_encrypted_storage_from_h1(&h1).unwrap();
+
+        assert!(
+            Config::apply_permanent_password_storage_for_sync(&mut cfg, &incoming, "").is_err()
+        );
+        assert!(cfg.password.is_empty());
+        assert!(cfg.salt.is_empty());
+    }
+
+    #[test]
+    fn test_permanent_password_sync_empty_storage_clears_existing_password() {
+        let salt = "salt123";
+        let h1 = compute_permanent_password_h1("p@ssw0rd", salt);
+        let mut cfg = Config::default();
+        cfg.password = encode_permanent_password_encrypted_storage_from_h1(&h1).unwrap();
+        cfg.salt = salt.to_owned();
+
+        assert!(Config::apply_permanent_password_storage_for_sync(&mut cfg, "", "").unwrap());
+        assert!(cfg.password.is_empty());
+        assert_eq!(cfg.salt, salt);
+    }
+
+    #[test]
+    fn test_permanent_password_sync_empty_storage_uses_incoming_salt() {
+        let old_salt = "old-salt";
+        let h1 = compute_permanent_password_h1("p@ssw0rd", old_salt);
+        let mut cfg = Config::default();
+        cfg.password = encode_permanent_password_encrypted_storage_from_h1(&h1).unwrap();
+        cfg.salt = old_salt.to_owned();
+
+        assert!(
+            Config::apply_permanent_password_storage_for_sync(&mut cfg, "", "new-salt").unwrap()
+        );
+        assert!(cfg.password.is_empty());
+        assert_eq!(cfg.salt, "new-salt");
     }
 
     #[test]
@@ -2836,5 +3996,27 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn test_uinput_ipc_path_is_shared_across_uids() {
+        const ROOT_UID: u32 = 0;
+        const USER_UID: u32 = 1000;
+
+        let path_root = Config::ipc_path_for_uid(ROOT_UID, "_uinput_keyboard");
+        let path_user = Config::ipc_path_for_uid(USER_UID, "_uinput_keyboard");
+        assert_eq!(path_root, path_user);
+
+        let app_name = APP_NAME.read().unwrap().clone();
+        assert!(
+            path_root.starts_with(&format!("/tmp/{app_name}-service/")),
+            "unexpected uinput ipc path: {}",
+            path_root
+        );
+
+        let non_service_root = Config::ipc_path_for_uid(ROOT_UID, "");
+        let non_service_user = Config::ipc_path_for_uid(USER_UID, "");
+        assert_ne!(non_service_root, non_service_user);
     }
 }
