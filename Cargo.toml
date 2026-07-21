@@ -58,6 +58,7 @@ flate2 = "1.0"
 libsqlite3-sys = { version = "*", features = ["bundled"] }
 # 需要同时修改 src/main.rs
 mimalloc = { version = "*" }
+openssl = { version = "*", features = ["vendored"] }
 
 
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
